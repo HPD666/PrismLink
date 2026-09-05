@@ -1,0 +1,81 @@
+import { Kyber1024Engine, KyberKeyPair } from '@prismlink/crypto-quantum';
+import { EventEmitter } from 'events';
+
+export interface PeerNode {
+  readonly id: string;
+  readonly address: string;
+  readonly port: number;
+  readonly publicKey: Uint8Array;
+  lastSeen: number;
+}
+
+export interface ProtocolPacket {
+  readonly version: number;
+  readonly packetId: string;
+  readonly senderId: string;
+  readonly recipientId: string;
+  readonly payload: Uint8Array;
+  readonly signature: Uint8Array;
+  readonly ttl: number;
+}
+
+export class MeshStateEngine extends EventEmitter {
+  private readonly nodeId: string;
+  private readonly keyPair: KyberKeyPair;
+  private readonly activePeers: Map<string, PeerNode> = new Map();
+  private readonly routingTable: Map<string, string> = new Map();
+
+  constructor(nodeId: string) {
+    super();
+    this.nodeId = nodeId;
+    this.keyPair = Kyber1024Engine.generateKeyPair();
+  }
+
+  public getIdentity(): { id: string; publicKey: Uint8Array } {
+    return {
+      id: this.nodeId,
+      publicKey: this.keyPair.publicKey
+    };
+  }
+
+  public registerPeer(peer: PeerNode): void {
+    this.activePeers.set(peer.id, {
+      ...peer,
+      lastSeen: Date.now()
+    });
+    this.routingTable.set(peer.id, peer.id);
+    this.emit('peer:connected', peer);
+  }
+
+  public routePacket(packet: ProtocolPacket): { nextHopId: string; forwardPacket: ProtocolPacket } {
+    if (packet.ttl <= 0) {
+      throw new Error(`Packet ${packet.packetId} TTL expired. Dropping frame.`);
+    }
+
+    const nextHopId = this.routingTable.get(packet.recipientId);
+    if (!nextHopId) {
+      throw new Error(`No available route in Mesh Table for destination node: ${packet.recipientId}`);
+    }
+
+    const forwardedPacket: ProtocolPacket = {
+      ...packet,
+      ttl: packet.ttl - 1
+    };
+
+    return { nextHopId, forwardPacket: forwardedPacket };
+  }
+
+  public processInboundHandshake(senderId: string, publicKey: Uint8Array, remoteAddr: string, port: number): Uint8Array {
+    const encap = Kyber1024Engine.encapsulate(publicKey);
+    
+    this.registerPeer({
+      id: senderId,
+      address: remoteAddr,
+      port,
+      publicKey,
+      lastSeen: Date.now()
+    });
+
+    return encap.ciphertext;
+  }
+}
