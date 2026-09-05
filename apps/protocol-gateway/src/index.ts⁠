@@ -1,0 +1,75 @@
+import { createServer } from 'http';
+import { MeshStateEngine } from '@prismlink/core-mesh';
+import { NetworkAdapterServer } from '@prismlink/network-adapter';
+import { Kyber1024Engine } from '@prismlink/crypto-quantum';
+
+const GATEWAY_ID = process.env.GATEWAY_ID || 'prismlink-gateway-us-east-01';
+const HTTP_PORT = parseInt(process.env.PORT || '8080', 10);
+const WS_PORT = parseInt(process.env.WS_PORT || '9090', 10);
+
+console.log(`[INIT] Starting PrismLink Protocol Gateway Node: ${GATEWAY_ID}`);
+
+// 1. Initialize Post-Quantum Mesh Engine
+const meshEngine = new MeshStateEngine(GATEWAY_ID);
+const identity = meshEngine.getIdentity();
+
+console.log(`[CRYPTO] Quantum Public Identity Initialized.`);
+console.log(`[CRYPTO] Node ID: ${identity.id}`);
+console.log(`[CRYPTO] Public Key Size: ${identity.publicKey.length} Bytes`);
+
+// 2. Instantiate Network Socket Transport Layer
+const networkServer = new NetworkAdapterServer(meshEngine, WS_PORT);
+console.log(`[NETWORK] P2P WebSocket Layer listening on port :${WS_PORT}`);
+
+// 3. Instantiate REST Metrics & Gateway Administration Server
+const httpServer = createServer((req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+
+  if (req.url === '/health' && req.method === 'GET') {
+    res.writeHead(200);
+    res.end(JSON.stringify({
+      status: 'HEALTHY',
+      nodeId: identity.id,
+      uptimeSeconds: process.uptime(),
+      timestamp: new Date().toISOString()
+    }));
+    return;
+  }
+
+  if (req.url === '/api/v1/encrypt' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); });
+    req.on('end', () => {
+      try {
+        const payload = JSON.parse(body);
+        const simKeyPair = Kyber1024Engine.generateKeyPair();
+        const encap = Kyber1024Engine.encapsulate(simKeyPair.publicKey);
+        const encrypted = Kyber1024Engine.encryptSymmetric(
+          Buffer.from(payload.data || ''),
+          encap.sharedSecret
+        );
+
+        res.writeHead(200);
+        res.end(JSON.stringify({
+          status: 'SUCCESS',
+          ciphertext: Buffer.from(encrypted.data).toString('hex'),
+          iv: Buffer.from(encrypted.iv).toString('hex'),
+          authTag: Buffer.from(encrypted.authTag).toString('hex'),
+          kemHeader: Buffer.from(encap.ciphertext).toString('hex')
+        }));
+      } catch (err: any) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  res.writeHead(404);
+  res.end(JSON.stringify({ error: 'Endpoint Not Found' }));
+});
+
+httpServer.listen(HTTP_PORT, () => {
+  console.log(`[HTTP] Gateway API Server active on http://0.0.0.0:${HTTP_PORT}`);
+  console.log(`[SYSTEM] PrismLink Full-Stack Engine fully operational.`);
+});
