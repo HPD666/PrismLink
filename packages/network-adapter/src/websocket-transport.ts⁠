@@ -1,0 +1,98 @@
+import { WebSocketServer, WebSocket } from 'ws';
+import { MeshStateEngine, ProtocolPacket } from '@prismlink/core-mesh';
+import { createServer, Server as HttpServer } from 'http';
+
+export class NetworkAdapterServer {
+  private server: HttpServer;
+  private wss: WebSocketServer;
+  private readonly meshEngine: MeshStateEngine;
+  private readonly activeSockets: Map<string, WebSocket> = new Map();
+
+  constructor(meshEngine: MeshStateEngine, port: number) {
+    this.meshEngine = meshEngine;
+    this.server = createServer();
+    this.wss = new WebSocketServer({ server: this.server });
+
+    this.setupListeners();
+    this.server.listen(port);
+  }
+
+  private setupListeners(): void {
+    this.wss.on('connection', (ws: WebSocket, req) => {
+      const remoteAddr = req.socket.remoteAddress || '127.0.0.1';
+      let authenticatedNodeId: string | null = null;
+
+      ws.on('message', (data: Buffer) => {
+        try {
+          const message = JSON.parse(data.toString());
+
+          if (message.type === 'HANDSHAKE_INIT') {
+            authenticatedNodeId = message.nodeId;
+            const responseCiphertext = this.meshEngine.processInboundHandshake(
+              message.nodeId,
+              new Uint8Array(Buffer.from(message.publicKey, 'hex')),
+              remoteAddr,
+              message.port
+            );
+
+            this.activeSockets.set(message.nodeId, ws);
+
+            ws.send(JSON.stringify({
+              type: 'HANDSHAKE_ACK',
+              nodeId: this.meshEngine.getIdentity().id,
+              ciphertext: Buffer.from(responseCiphertext).toString('hex')
+            }));
+            return;
+          }
+
+          if (message.type === 'PACKET_TRANSMIT') {
+            const rawPacket: ProtocolPacket = {
+              version: message.packet.version,
+              packetId: message.packet.packetId,
+              senderId: message.packet.senderId,
+              recipientId: message.packet.recipientId,
+              payload: new Uint8Array(Buffer.from(message.packet.payload, 'hex')),
+              signature: new Uint8Array(Buffer.from(message.packet.signature, 'hex')),
+              ttl: message.packet.ttl
+            };
+
+            const { nextHopId, forwardPacket } = this.meshEngine.routePacket(rawPacket);
+            this.forwardToSocket(nextHopId, forwardPacket);
+          }
+        } catch (error: any) {
+          ws.send(JSON.stringify({ type: 'ERROR', message: error.message }));
+        }
+      });
+
+      ws.on('close', () => {
+        if (authenticatedNodeId) {
+          this.activeSockets.delete(authenticatedNodeId);
+        }
+      });
+    });
+  }
+
+  public forwardToSocket(nodeId: string, packet: ProtocolPacket): void {
+    const targetSocket = this.activeSockets.get(nodeId);
+    if (!targetSocket || targetSocket.readyState !== WebSocket.OPEN) {
+      throw new Error(`Socket transport to node ${nodeId} is unavailable.`);
+    }
+
+    targetSocket.send(JSON.stringify({
+      type: 'PACKET_TRANSMIT',
+      packet: {
+        ...packet,
+        payload: Buffer.from(packet.payload).toString('hex'),
+        signature: Buffer.from(packet.signature).toString('hex')
+      }
+    }));
+  }
+
+  public close(): Promise<void> {
+    return new Promise((resolve) => {
+      this.wss.close(() => {
+        this.server.close(() => resolve());
+      });
+    });
+  }
+}
